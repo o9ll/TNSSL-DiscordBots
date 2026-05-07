@@ -1,4 +1,4 @@
-import {AttachmentBuilder, Client, ContainerBuilder, MediaGalleryBuilder, MediaGalleryItemBuilder, MessageFlags, SectionBuilder, TextChannel, TextDisplayBuilder, ThumbnailBuilder} from "discord.js";
+import {ActionRowBuilder, AttachmentBuilder, ButtonBuilder, ButtonStyle, Client, ContainerBuilder, MediaGalleryBuilder, MediaGalleryItemBuilder, MessageFlags, SectionBuilder, TextChannel, TextDisplayBuilder, ThumbnailBuilder} from "discord.js";
 import {EnvConfig} from "../utils/envConfig";
 import {createLogger} from "../utils/logger";
 import * as fs from "fs";
@@ -83,6 +83,8 @@ interface FreeGamesConfig {
     minRating: number;
     allowedStores: string[];
 }
+
+type FreeGameDisplayItem = {container: ContainerBuilder; logoAttachment: AttachmentBuilder | null};
 
 
 /**
@@ -187,6 +189,171 @@ function pruneExpiredCurrentGames(state: FreeGamesState): boolean {
     const changed = pruned.length !== current.length;
     state.currentGames = pruned;
     return changed;
+}
+
+function collectStringCandidates(value: unknown, output: string[], seen = new Set<object>(), depth = 0): void {
+    if (depth > 4 || value == null) {
+        return;
+    }
+
+    if (typeof value === "string") {
+        const trimmed = value.trim();
+        if (trimmed) {
+            output.push(trimmed);
+        }
+        return;
+    }
+
+    if (typeof value !== "object") {
+        return;
+    }
+
+    if (seen.has(value)) {
+        return;
+    }
+    seen.add(value);
+
+    if (Array.isArray(value)) {
+        for (const item of value) {
+            collectStringCandidates(item, output, seen, depth + 1);
+        }
+        return;
+    }
+
+    for (const nestedValue of Object.values(value as Record<string, unknown>)) {
+        collectStringCandidates(nestedValue, output, seen, depth + 1);
+    }
+}
+
+/**
+ * Essaie de retrouver une URL Epic "purchase" exploitable pour regrouper plusieurs offres dans le même panier.
+ * On accepte plusieurs sources possibles pour rester compatible avec les payloads FreeStuff qui évoluent.
+ */
+function extractEpicPurchaseUrl(product: Product): string | null {
+    const seen = new Set<string>();
+    const candidates: string[] = [];
+    collectStringCandidates(product, candidates);
+
+    if (Array.isArray((product as Product & Record<string, unknown>).urls)) {
+        for (const urlEntry of (product as Product & Record<string, unknown>).urls as Array<{url?: unknown}>) {
+            collectStringCandidates(urlEntry?.url, candidates);
+        }
+    }
+
+    for (const candidate of candidates) {
+        if (seen.has(candidate)) continue;
+        seen.add(candidate);
+
+        try {
+            const parsed = new URL(candidate);
+            const offers = parsed.searchParams.getAll("offers").map(value => value.trim()).filter(Boolean);
+            if (offers.length > 0 && parsed.pathname.includes("/purchase")) {
+                return candidate;
+            }
+        } catch {
+            const match = candidate.match(/https?:\/\/[^\s"']+purchase\?[^\s"']*offers=[^\s"']+/i);
+            if (match) {
+                return match[0];
+            }
+        }
+    }
+
+    return null;
+}
+
+/**
+ * Construit une URL Epic "purchase" unique à partir de plusieurs produits compatibles.
+ * Les produits qui ne fournissent pas d'URL de panier Epic sont ignorés.
+ */
+function buildEpicClaimAllUrl(products: Product[]): string | null {
+    const offerValues = new Set<string>();
+    let baseUrl: string | null = null;
+    let hashFragment = "";
+
+    for (const product of products) {
+        if (product.store !== "epic" || product.kind !== "game" || !isProductActive(product)) {
+            continue;
+        }
+
+        const purchaseUrl = extractEpicPurchaseUrl(product);
+        if (!purchaseUrl) {
+            continue;
+        }
+
+        try {
+            const parsed = new URL(purchaseUrl);
+            const offers = parsed.searchParams.getAll("offers").map(value => value.trim()).filter(Boolean);
+            if (offers.length === 0) {
+                continue;
+            }
+
+            if (!baseUrl) {
+                baseUrl = `${parsed.origin}${parsed.pathname}`;
+                hashFragment = parsed.hash || "";
+            }
+
+            for (const offer of offers) {
+                offerValues.add(offer);
+            }
+        } catch {
+            const offers = purchaseUrl.match(/offers=([^&#]+)/gi);
+            if (!offers || offers.length === 0) {
+                continue;
+            }
+
+            if (!baseUrl) {
+                const baseMatch = purchaseUrl.match(/^(https?:\/\/[^?#]+\/purchase)/i);
+                if (baseMatch) {
+                    baseUrl = baseMatch[1];
+                }
+                const hashMatch = purchaseUrl.match(/(#.*)$/);
+                if (hashMatch) {
+                    hashFragment = hashMatch[1];
+                }
+            }
+
+            for (const offer of offers) {
+                const value = offer.split("=")[1]?.trim();
+                if (value) {
+                    offerValues.add(value);
+                }
+            }
+        }
+    }
+
+    if (!baseUrl || offerValues.size === 0) {
+        return null;
+    }
+
+    const query = [...offerValues].map(offer => `offers=${encodeURIComponent(offer)}`).join("&");
+    return `${baseUrl}?${query}${hashFragment}`;
+}
+
+/**
+ * Crée le bandeau "Claim All" pour les jeux Epic si un panier de paiement combiné est disponible.
+ */
+function createEpicClaimAllPanel(products: Product[]): FreeGameDisplayItem | null {
+    const claimUrl = buildEpicClaimAllUrl(products);
+    if (!claimUrl) {
+        return null;
+    }
+
+    const container = new ContainerBuilder().setAccentColor(0x313131);
+    container.addTextDisplayComponents(
+        new TextDisplayBuilder().setContent(
+            "### 🛒 Claim All\n" +
+            "Regroupe tous les jeux Epic gratuits détectés dans le même panier.")
+    );
+    container.addActionRowComponents(
+        new ActionRowBuilder<ButtonBuilder>().addComponents(
+            new ButtonBuilder()
+                .setLabel("Claim All")
+                .setStyle(ButtonStyle.Link)
+                .setURL(claimUrl)
+        )
+    );
+
+    return {container, logoAttachment: null};
 }
 
 /**
@@ -382,7 +549,10 @@ export function getCurrentFreeGames(category?: "games" | "other"): { container: 
         activeGames = activeGames.filter(p => p.kind !== "game");
     }
 
-    return activeGames.map(product => createFreeGameEmbed(product));
+    const displayItems = activeGames.map(product => createFreeGameEmbed(product));
+    const claimAllPanel = category === "other" ? null : createEpicClaimAllPanel(activeGames);
+
+    return claimAllPanel ? [claimAllPanel, ...displayItems] : displayItems;
 }
 
 /**
@@ -601,7 +771,7 @@ export async function processAnnouncement(client: Client, announcement: Resolved
             return;
         }
 
-        const products: { container: ContainerBuilder; file: AttachmentBuilder | null; id: number }[] = [];
+        const products: { container: ContainerBuilder; file: AttachmentBuilder | null; id: number; product: Product }[] = [];
         const filterConfig = loadFilterConfig();
 
         // Créer tous les containers et attachments
@@ -638,7 +808,7 @@ export async function processAnnouncement(client: Client, announcement: Resolved
             }
 
             const {container, logoAttachment} = createFreeGameEmbed(product);
-            products.push({container, file: logoAttachment, id: product.id});
+            products.push({container, file: logoAttachment, id: product.id, product});
 
             // Ajouter à la liste des jeux notifiés (pour historique seulement)
             if (!state.notifiedGames.includes(product.id)) {
@@ -648,6 +818,8 @@ export async function processAnnouncement(client: Client, announcement: Resolved
 
         // Envoyer tous les produits dans un seul message (components v2)
         if (products.length > 0) {
+            const claimAllPanel = createEpicClaimAllPanel(products.map(p => p.product));
+
             // Déterminer les pings nécessaires (dédupliqués)
             const mentionSet = new Set<string>();
             for (const {id} of products) {
@@ -662,9 +834,11 @@ export async function processAnnouncement(client: Client, announcement: Resolved
 
             // Avec IS_COMPONENTS_V2, le champ 'content' est interdit.
             // La mention de rôle est donc ajoutée comme TextDisplay en tête des composants.
-            const components: any[] = mentionText
-                ? [new TextDisplayBuilder().setContent(mentionText), ...allContainers]
-                : allContainers;
+            const components: any[] = [
+                ...(mentionText ? [new TextDisplayBuilder().setContent(mentionText)] : []),
+                ...(claimAllPanel ? [claimAllPanel.container] : []),
+                ...allContainers
+            ];
 
             const message: any = {
                 components,
